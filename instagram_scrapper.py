@@ -4,6 +4,7 @@ Bright Data snapshot photo bulk downloader
 """
 
 import csv
+import json
 import os
 import re
 import sys
@@ -23,8 +24,11 @@ TIMEOUT = 30
 # ====================================
 
 PHOTOS_COL = "photos"
+IMAGES_COL = "images"
+THUMBNAIL_COL = "thumbnail"
 URL_COL = "url"
 USER_COL = "user_posted"
+SHORTCODE_COL = "shortcode"
 
 
 def build_session() -> requests.Session:
@@ -54,9 +58,31 @@ def sanitize_filename(name: str) -> str:
 
 
 def extract_urls(raw: str) -> list[str]:
-    """Parse a pipe- or newline-separated list of photo URLs from a CSV cell."""
+    """Extract photo URLs from a CSV cell.
+
+    The cell may contain:
+    - a JSON array of URL strings: ["https://...", ...]
+    - a JSON array of objects with a "url" key: [{"url": "https://...", ...}, ...]
+    - a plain URL string
+    - pipe- or newline-separated URLs
+    """
     if not raw:
         return []
+    raw = raw.strip()
+    # Try JSON first
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+            urls = []
+            for item in parsed:
+                if isinstance(item, str) and item.startswith("http"):
+                    urls.append(item)
+                elif isinstance(item, dict) and item.get("url", "").startswith("http"):
+                    urls.append(item["url"])
+            return urls
+        except json.JSONDecodeError:
+            pass
+    # Fallback: plain URL or pipe/newline-separated list
     urls = [u.strip() for u in re.split(r"[\|\n]+", raw) if u.strip()]
     return [u for u in urls if u.startswith("http")]
 
@@ -102,10 +128,20 @@ def process_row(
 ) -> tuple[int, int]:
     username = sanitize_filename(row.get(USER_COL, "") or f"row{row_index}")
     post_url = row.get(URL_COL, "")
-    post_id = sanitize_filename(Path(urlparse(post_url).path).name) or str(row_index)
+    shortcode = sanitize_filename(
+        row.get(SHORTCODE_COL, "")
+        or Path(urlparse(post_url).path).name
+        or str(row_index)
+    )
 
-    photos_raw = row.get(PHOTOS_COL, "")
-    photo_urls = extract_urls(photos_raw)
+    # Prefer the `photos` JSON array; fall back to `images`, then `thumbnail`
+    photo_urls = extract_urls(row.get(PHOTOS_COL, ""))
+    if not photo_urls:
+        photo_urls = extract_urls(row.get(IMAGES_COL, ""))
+    if not photo_urls:
+        thumb = (row.get(THUMBNAIL_COL, "") or "").strip()
+        if thumb.startswith("http"):
+            photo_urls = [thumb]
 
     if not photo_urls:
         return 0, 0
@@ -114,7 +150,7 @@ def process_row(
     fail = 0
     for idx, photo_url in enumerate(photo_urls, start=1):
         ext = derive_extension(photo_url)
-        filename = f"{username}_{post_id}_{idx}{ext}"
+        filename = f"{username}_{shortcode}_{idx}{ext}"
         dest = output_dir / username / filename
         try:
             download_file(session, photo_url, dest)
